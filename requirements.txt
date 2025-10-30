@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+streamlit
+transformers
+torch
+tree-sitter
+pylint
+radon
+bandit
+flake8
+langchain
+faiss-cpu
+pandas
+plotly
