@@ -89,5 +89,3 @@ if __name__ == '__main__':
 		sys.exit(1)
 	data = analyze_file(sys.argv[1])
 	print(json.dumps(data, indent=2))
-data = analyze_file(sys.argv[1])
-print(json.dumps(data, indent=2))

@@ -1,11 +1,9 @@
-def add(a, b):
-    """Add two numbers."""
-    return a + b
+import os
 
 
+def greet(name):
+    print(f"Hello {name}")
 
-def complex_fn(x):
-    for i in range(5):
-        if i % 2 == 0:
-            x += i
-    return x
+
+def unsafe():
+    eval('2 + 2') # intentional security issue
