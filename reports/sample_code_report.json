@@ -1,0 +1,68 @@
+{
+  "file": "sample_code.py",
+  "generated_at": "2025-11-04T11:43:38",
+  "summary": {
+    "total_functions": 2,
+    "avg_complexity": 1.0,
+    "maintainability_index": 100,
+    "security_issues": 1,
+    "lint_issues": 2,
+    "overall_score": 96.2
+  },
+  "details": {
+    "ast_analysis": [
+      {
+        "name": "greet",
+        "lines": 2,
+        "has_docstring": false,
+        "complexity": 1
+      },
+      {
+        "name": "unsafe",
+        "lines": 2,
+        "has_docstring": false,
+        "complexity": 1
+      }
+    ],
+    "static_analysis": {
+      "path": "sample_code.py",
+      "pylint": {
+        "tool": "pylint",
+        "exit_code": 4,
+        "issue_count": 2,
+        "issues": [
+          {
+            "type": "warning",
+            "message": "Use of eval",
+            "symbol": "eval-used",
+            "line": 9
+          },
+          {
+            "type": "warning",
+            "message": "Unused import os",
+            "symbol": "unused-import",
+            "line": 1
+          }
+        ]
+      },
+      "bandit": {
+        "tool": "bandit",
+        "exit_code": 1,
+        "issue_count": 1,
+        "issues": [
+          {
+            "filename": ".\\sample_code.py",
+            "line_number": 9,
+            "issue_severity": "MEDIUM",
+            "issue_text": "Use of possibly insecure function - consider using safer ast.literal_eval.",
+            "test_id": "B307"
+          }
+        ]
+      },
+      "radon": {
+        "tool": "radon",
+        "error": "'float' object is not iterable"
+      }
+    }
+  }
+}
