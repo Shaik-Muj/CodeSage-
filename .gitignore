@@ -11,6 +11,12 @@ env/
 # Streamlit
 .streamlit/
 
+# Local model caches and large downloads
+# common names: model_cache, model_Cache, model-cache, model_cache/
+models_cache/
+model_Cache/
+model-cache/
+
 # IDEs
 .vscode/
 .idea/
