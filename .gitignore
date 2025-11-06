@@ -16,6 +16,7 @@ env/
 models_cache/
 model_Cache/
 model-cache/
+models_cache/
 
 # IDEs
 .vscode/
