@@ -42,7 +42,7 @@ def generate_l1_feedback(report: dict) -> dict:
     else:
         summary_text = "Low code quality — refactoring is recommended."
 
-    feedback = []
+    feedback, recs = [], []
     for func in ast_data:
         name = func.get("name", "unknown_function")
         comp = func.get("complexity", 0)
@@ -56,7 +56,6 @@ def generate_l1_feedback(report: dict) -> dict:
         else:
             feedback.append(f"'{name}' looks clean and simple — maintain this readability.")
 
-    recs = []
     if issues > 5:
         recs.append("Resolve linting warnings to improve consistency.")
     elif issues > 0:
@@ -79,14 +78,14 @@ def generate_l1_feedback(report: dict) -> dict:
 
 
 # =========================================================
-# SHARED MODEL (Phi-3-Mini-4K-Instruct)
+# Shared Model Loader (GPU-Preferred Phi-3)
 # =========================================================
 
 _phi_model, _phi_tokenizer, _phi_pipeline = None, None, None
 
 
 def load_phi_model():
-    """Load the Phi-3-Mini-4K-Instruct model once."""
+    """Load Phi-3 Mini optimized for GPU; fallback to CPU if necessary."""
     global _phi_model, _phi_tokenizer, _phi_pipeline
 
     if _phi_model is not None and _phi_pipeline is not None:
@@ -94,23 +93,43 @@ def load_phi_model():
 
     print("[INFO] Loading Phi-3-Mini-4K-Instruct model...")
     model_id = "microsoft/Phi-3-mini-4k-instruct"
-
     _phi_tokenizer = AutoTokenizer.from_pretrained(model_id)
-    _phi_model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        device_map="auto",
-        torch_dtype="auto",
-        low_cpu_mem_usage=True,
-        load_in_4bit=True
-    )
+
+    # Prefer GPU if available
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        total_vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        print(f"[INFO] GPU detected: {gpu_name} ({total_vram:.1f} GB VRAM)")
+
+        try:
+            _phi_model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                device_map="cuda",
+                torch_dtype=torch.float16,
+                low_cpu_mem_usage=True
+            )
+            print("[INFO] Model successfully loaded on GPU ✅")
+        except Exception as e:
+            print(f"[WARN] GPU load failed ({e}); falling back to CPU.")
+            _phi_model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                torch_dtype=torch.float32
+            )
+    else:
+        print("[INFO] No GPU available → Loading on CPU (float32).")
+        _phi_model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch.float32
+        )
 
     _phi_pipeline = pipeline("text-generation", model=_phi_model, tokenizer=_phi_tokenizer)
-    print("[INFO] Phi-3-Mini-4K-Instruct model loaded ✅")
+    print(f"[INFO] Model device: {_phi_model.device}")
+    print("[INFO] Phi-3-Mini-4K-Instruct loaded and ready ✅")
     return _phi_pipeline
 
 
 # =========================================================
-# L2 & L3 AI Feedback (Shared Model)
+# L2 & L3 AI Feedback
 # =========================================================
 
 def generate_l2_feedback(report: dict) -> dict:
@@ -147,6 +166,7 @@ Return JSON only:
             return {**json.loads(m), "score": summary.get("overall_score", 0)}
         except json.JSONDecodeError:
             continue
+
     return {"summary": text_output, "function_feedback": [], "general_recommendations": [], "score": 0}
 
 
@@ -158,22 +178,18 @@ def generate_l3_feedback(report: dict) -> dict:
 
     prompt = f"""
 You are CodeSage's expert refinement AI.
-
-You are reviewing a full Python codebase report with multiple functions.
-Analyze the input JSON thoroughly — it includes function-level feedback and general insights.
+Analyze the input JSON, which includes function-level feedback and insights.
 
 Task:
-- Refine the writing for clarity and helpfulness.
-- Merge redundant ideas and fix incomplete feedback.
-- Preserve ALL functions and structure.
-- Maintain valid JSON output.
+- Refine wording for clarity and professionalism.
+- Merge redundant points.
+- Ensure JSON validity and keep structure intact.
 
 Input JSON:
 {l2_json}
 
 Return only valid JSON.
 """
-
 
     response = text_gen(prompt, max_new_tokens=400, temperature=0.3, top_p=0.9)
     text_output = response[0]["generated_text"].strip()
@@ -193,26 +209,27 @@ Return only valid JSON.
 # =========================================================
 
 def auto_select_feedback_engine(report: dict) -> dict:
-    """Smartly pick between L1/L2/L3 based on system and stability."""
+    """Automatically pick L1/L2/L3 based on GPU VRAM."""
     try:
         if torch.cuda.is_available():
-            total_vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-            print(f"[AUTO] GPU detected: {torch.cuda.get_device_name(0)} ({total_vram:.1f} GB VRAM)")
+            vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            gpu_name = torch.cuda.get_device_name(0)
+            print(f"[AUTO] GPU detected: {gpu_name} ({vram:.1f} GB VRAM)")
 
-            if total_vram >= 6:
-                print("[AUTO] Enough VRAM → Using L3 (Refinement)")
+            if vram >= 6:
+                print("[AUTO] Using L3 (Refined Feedback)")
                 return generate_l3_feedback(report)
-            elif total_vram >= 3:
-                print("[AUTO] Limited VRAM → Using L2 (Analysis)")
+            elif vram >= 3:
+                print("[AUTO] Using L2 (AI Analysis)")
                 return generate_l2_feedback(report)
             else:
-                print("[AUTO] Low VRAM → Falling back to L1 (Heuristic)")
+                print("[AUTO] Using L1 (Heuristic Feedback)")
                 return generate_l1_feedback(report)
         else:
             print("[AUTO] No GPU detected → Using L1 (Heuristic)")
             return generate_l1_feedback(report)
     except Exception as e:
-        print(f"[AUTO] Runtime error: {e} → Falling back to L1")
+        print(f"[AUTO] Error: {e} → Falling back to L1")
         return generate_l1_feedback(report)
 
 
@@ -221,11 +238,7 @@ def auto_select_feedback_engine(report: dict) -> dict:
 # =========================================================
 
 def generate_feedback(report: dict, mode: str | None = None) -> dict:
-    """Select feedback engine manually or automatically.
-
-    If 'mode' is provided, it overrides configuration. Otherwise, reads
-    app.config.FEEDBACK_MODE (defaults to 'L1').
-    """
+    """Select feedback engine manually or automatically."""
     mode = (mode or getattr(config, "FEEDBACK_MODE", "L1")).upper()
     if mode == "AUTO":
         return auto_select_feedback_engine(report)
@@ -238,7 +251,7 @@ def generate_feedback(report: dict, mode: str | None = None) -> dict:
 
 
 # =========================================================
-# TESTING ENTRY POINT
+# TEST ENTRY POINT
 # =========================================================
 
 if __name__ == "__main__":
@@ -259,4 +272,4 @@ if __name__ == "__main__":
 
     print("\n=== CODE REVIEW FEEDBACK ===\n")
     print(json.dumps(feedback, indent=2, ensure_ascii=False))
-    print("\n[INFO] Done ")
+    print("\n[INFO] Done ✅")

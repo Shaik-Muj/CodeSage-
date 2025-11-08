@@ -162,7 +162,6 @@ if uploaded:
         st.success("✅ Static analysis complete!")
 
         st.info("🤖 Generating AI Feedback...")
-        # Pass selected mode directly to the feedback generator (avoids stale globals)
         feedback = generate_feedback(wrapped, mode=mode)
         st.success("✅ AI feedback ready!")
 
@@ -171,21 +170,31 @@ if uploaded:
         # -------------------------------------------------------
         tab1, tab2, tab3 = st.tabs(["🧠 Overview", "🔍 Function Feedback", "💡 Recommendations"])
 
+        # ✅ FIXED Overview Tab (correct metric references)
         with tab1:
             st.markdown("### Code Review Summary")
             st.write(feedback.get("summary", "No summary available."))
 
             score = feedback.get("score", 0)
             st.markdown(f"### Code Quality Score: **{score}/100**")
-
-            # Visual progress bar
             st.progress(min(score / 100, 1.0))
 
-            # Basic metrics grid
+            # Extract proper summary metrics
+            summary = report.get("summary", {})
+
             col1, col2, col3 = st.columns(3)
-            col1.metric("Maintainability", f"{report.get('maintainability_index', 0)}")
-            col2.metric("Avg Complexity", f"{report.get('avg_complexity', 0)}")
-            col3.metric("Lint Issues", f"{report.get('lint_issues', 0)}")
+            with col1:
+                st.metric("Maintainability", f"{summary.get('maintainability_index', 0)}")
+            with col2:
+                st.metric("Avg Complexity", f"{summary.get('avg_complexity', 0)}")
+            with col3:
+                st.metric("Lint Issues", f"{summary.get('lint_issues', 0)}")
+
+            st.markdown(f"""
+            **Total Functions:** {summary.get('total_functions', 0)}  
+            **Security Issues:** {summary.get('security_issues', 0)}  
+            **Generated At:** {report.get('generated_at', 'N/A')}
+            """)
 
         with tab2:
             st.markdown("### Function-Level Insights")
