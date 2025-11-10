@@ -1,17 +1,11 @@
 """
 CodeSage — AI Code Reviewer (Enhanced Dashboard v3)
-----------------------------------------------------
-Modern Streamlit dashboard for CodeSage.
-Features:
-- File upload + code preview
-- Run Static + AI analysis (L1, L2, L3)
-- Interactive summary, metrics, and function feedback
-- Download JSON / PDF reports
 """
 
 import streamlit as st
 import tempfile
 import json
+import time
 from pathlib import Path
 from datetime import datetime
 from io import BytesIO
@@ -19,79 +13,34 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import Paragraph, Spacer, SimpleDocTemplate
 
-# Ensure project root is on sys.path when run via `streamlit run app/ui/dashboard.py`
+# Add repo to path if running as script
 try:
-    from app.ai_engine.llm_feedback import generate_feedback
+    from app.ai_engine.llm_feedback import generate_feedback, load_phi_model
     from app.core.report_generator import generate_code_report
     from app import config
 except ModuleNotFoundError:
     import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # add '<repo>/codesage' to path
-    from app.ai_engine.llm_feedback import generate_feedback
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from app.ai_engine.llm_feedback import generate_feedback, load_phi_model
     from app.core.report_generator import generate_code_report
     from app import config
 
-# -------------------------------------------------------
-# Page Config & Theme
-# -------------------------------------------------------
-st.set_page_config(
-    page_title="CodeSage — AI Code Reviewer",
-    layout="wide",
-    page_icon="🤖",
-    initial_sidebar_state="expanded"
-)
+# Page config
+st.set_page_config(page_title="CodeSage — AI Code Reviewer", layout="wide", page_icon="🤖", initial_sidebar_state="expanded")
 
-# -------------------------------------------------------
-# Custom CSS (for better visuals)
-# -------------------------------------------------------
+# Minimal CSS (kept from your previous version)
 st.markdown("""
     <style>
-    /* Global layout */
-    .main {
-        background-color: #0d1117;
-        color: #e6edf3;
-    }
-    h1, h2, h3, h4 {
-        color: #00e0b0 !important;
-    }
-    .stCodeBlock {
-        border-radius: 10px !important;
-        background-color: #161b22 !important;
-    }
-    .css-1d391kg p {
-        color: #c9d1d9 !important;
-    }
-    .stButton>button {
-        border-radius: 8px;
-        background: linear-gradient(90deg, #00e0b0, #008cff);
-        color: white;
-        font-weight: 600;
-        padding: 0.5rem 1rem;
-        border: none;
-        transition: 0.3s ease;
-    }
-    .stButton>button:hover {
-        transform: scale(1.05);
-        background: linear-gradient(90deg, #00ffc6, #00aaff);
-    }
-    .stDownloadButton>button {
-        background: #1f6feb !important;
-        color: white !important;
-        border-radius: 6px !important;
-        font-weight: 500 !important;
-    }
-    .stDownloadButton>button:hover {
-        background: #238636 !important;
-    }
-    div[data-testid="stMetricValue"] {
-        color: #00ffc6 !important;
-    }
+    .main { background-color: #0d1117; color: #e6edf3; }
+    h1,h2,h3,h4 { color: #00e0b0 !important; }
+    .stCodeBlock { border-radius: 10px !important; background-color: #161b22 !important; }
+    .stButton>button { border-radius: 8px; background: linear-gradient(90deg,#00e0b0,#008cff); color:white; font-weight:600; }
+    .stDownloadButton>button { background: #1f6feb !important; color: white !important; }
+    div[data-testid="stMetricValue"] { color: #00ffc6 !important; }
     </style>
 """, unsafe_allow_html=True)
 
-# -------------------------------------------------------
-# Utility Functions
-# -------------------------------------------------------
+# Utility exporters
 def make_json_bytes(report: dict) -> bytes:
     return json.dumps(report, indent=2, ensure_ascii=False).encode("utf-8")
 
@@ -100,43 +49,45 @@ def make_pdf_bytes(report: dict, title: str = "CodeSage Report") -> bytes:
     doc = SimpleDocTemplate(buf, pagesize=A4, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
     styles = getSampleStyleSheet()
     story = []
-
     story.append(Paragraph(f"<b>{title}</b>", styles["Title"]))
     story.append(Spacer(1, 12))
     ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
     story.append(Paragraph(f"Generated: {ts}", styles["Normal"]))
     story.append(Spacer(1, 12))
-
     story.append(Paragraph("<b>Summary</b>", styles["Heading2"]))
     story.append(Paragraph(report.get("summary", "No summary available."), styles["Normal"]))
     story.append(Spacer(1, 12))
-
     story.append(Paragraph("<b>Function Feedback</b>", styles["Heading2"]))
     for f in report.get("function_feedback", []):
         story.append(Paragraph(f"- {f}", styles["Normal"]))
-
     story.append(Spacer(1, 12))
     story.append(Paragraph("<b>Recommendations</b>", styles["Heading2"]))
     for r in report.get("general_recommendations", []):
         story.append(Paragraph(f"- {r}", styles["Normal"]))
-
     story.append(Spacer(1, 12))
     story.append(Paragraph(f"<b>Score:</b> {report.get('score', 'N/A')}", styles["Normal"]))
-
     doc.build(story)
     pdf = buf.getvalue()
     buf.close()
     return pdf
 
-# -------------------------------------------------------
-# UI — Header
-# -------------------------------------------------------
 st.title("🤖 CodeSage — AI Code Reviewer")
-st.caption("AI-Powered Python Code Quality Analysis • Feature Engineering + LLM Review")
+st.caption("AI-Powered Python Code Quality Analysis • Local LLM Feedback")
 
 st.markdown("---")
-
 uploaded = st.file_uploader("📤 Upload a Python file for review", type=["py"])
+
+# Streamlit cache to warm/load the model once (only used for L2/L3)
+@st.cache_resource
+def get_cached_model():
+    # load_phi_model will do a safe load (quantized if possible)
+    # We just call it to ensure model is initialized and cached by Streamlit
+    try:
+        load_phi_model()
+        return True
+    except Exception as e:
+        print("[CACHE] model warm-up failed:", e)
+        return False
 
 if uploaded:
     code_bytes = uploaded.read()
@@ -155,22 +106,32 @@ if uploaded:
     st.sidebar.header("⚙️ Controls")
     mode = st.sidebar.selectbox("Review Mode", ["AUTO", "L1", "L2", "L3"])
     st.sidebar.markdown("### ")
+
     if st.sidebar.button("🚀 Run CodeSage Review"):
+        # 1) Static analysis
         st.info("🔍 Running static analysis...")
+        t0 = time.perf_counter()
         report = generate_code_report(temp_path)
-        wrapped = {"summary": report, "details": {"ast_analysis": report.get("ast_analysis", [])}}
-        st.success("✅ Static analysis complete!")
+        t1 = time.perf_counter()
+        static_time = t1 - t0
+        st.success(f"✅ Static analysis complete ({static_time:.1f}s)")
 
+        # 2) Warm model if needed (L2/L3/AUTO when GPU available)
+        if mode.upper() in ("AUTO", "L2", "L3"):
+            st.info("🔁 Warming model (cached)...")
+            get_cached_model()
+
+        # 3) AI feedback
         st.info("🤖 Generating AI Feedback...")
-        feedback = generate_feedback(wrapped, mode=mode)
-        st.success("✅ AI feedback ready!")
+        t0 = time.perf_counter()
+        feedback = generate_feedback(report, mode=mode)
+        t1 = time.perf_counter()
+        ai_time = t1 - t0
+        st.success(f"✅ AI feedback ready ({ai_time:.1f}s)")
 
-        # -------------------------------------------------------
-        # Display Results (Tabs)
-        # -------------------------------------------------------
+        # Display results
         tab1, tab2, tab3 = st.tabs(["🧠 Overview", "🔍 Function Feedback", "💡 Recommendations"])
 
-        # ✅ FIXED Overview Tab (correct metric references)
         with tab1:
             st.markdown("### Code Review Summary")
             st.write(feedback.get("summary", "No summary available."))
@@ -179,7 +140,7 @@ if uploaded:
             st.markdown(f"### Code Quality Score: **{score}/100**")
             st.progress(min(score / 100, 1.0))
 
-            # Extract proper summary metrics
+            # Use correct summary dict
             summary = report.get("summary", {})
 
             col1, col2, col3 = st.columns(3)
@@ -193,25 +154,29 @@ if uploaded:
             st.markdown(f"""
             **Total Functions:** {summary.get('total_functions', 0)}  
             **Security Issues:** {summary.get('security_issues', 0)}  
-            **Generated At:** {report.get('generated_at', 'N/A')}
+            **Static analysis time:** {static_time:.1f}s  
+            **AI run time:** {ai_time:.1f}s
             """)
 
         with tab2:
             st.markdown("### Function-Level Insights")
-            for f in feedback.get("function_feedback", []):
+            functions = feedback.get("function_feedback", [])
+            if not functions:
+                st.info("No function-level feedback available.")
+            for f in functions:
                 st.success(f"✅ {f}")
 
         with tab3:
             st.markdown("### General Recommendations")
-            for r in feedback.get("general_recommendations", []):
+            recs = feedback.get("general_recommendations", [])
+            if not recs:
+                st.info("No recommendations.")
+            for r in recs:
                 st.warning(f"💡 {r}")
 
-        # -------------------------------------------------------
-        # Export Section
-        # -------------------------------------------------------
+        # Export section
         st.markdown("---")
         st.subheader("📁 Export Your Report")
-
         json_bytes = make_json_bytes(feedback)
         pdf_bytes = make_pdf_bytes(feedback)
 
@@ -220,6 +185,5 @@ if uploaded:
             st.download_button("⬇️ Download JSON", data=json_bytes, file_name="codesage_report.json", mime="application/json")
         with c2:
             st.download_button("🧾 Download PDF", data=pdf_bytes, file_name="codesage_report.pdf", mime="application/pdf")
-
 else:
     st.info("Upload a Python file to start your AI code review 🚀")

@@ -1,16 +1,14 @@
 import json
 import random
+import re
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 from app import config
 
-
-# =========================================================
-# L1: Heuristic Feedback (Fast, Offline)
-# =========================================================
-
+# -----------------------
+# Heuristic (L1)
+# -----------------------
 def compute_quality_score(report: dict) -> int:
-    """Compute an overall quality score from static metrics."""
     summary = report.get("summary", {})
     maintainability = summary.get("maintainability_index", 100)
     complexity = summary.get("avg_complexity", 0)
@@ -25,7 +23,6 @@ def compute_quality_score(report: dict) -> int:
 
 
 def generate_l1_feedback(report: dict) -> dict:
-    """Lightweight rule-based feedback (Heuristic)."""
     summary = report.get("summary", {})
     ast_data = report.get("details", {}).get("ast_analysis", [])
 
@@ -42,11 +39,10 @@ def generate_l1_feedback(report: dict) -> dict:
     else:
         summary_text = "Low code quality — refactoring is recommended."
 
-    feedback, recs = [], []
+    feedback = []
     for func in ast_data:
         name = func.get("name", "unknown_function")
         comp = func.get("complexity", 0)
-
         if comp > 15:
             feedback.append(f"Function '{name}' is too complex (complexity {comp}). Consider breaking it up.")
         elif comp > 10:
@@ -56,6 +52,7 @@ def generate_l1_feedback(report: dict) -> dict:
         else:
             feedback.append(f"'{name}' looks clean and simple — maintain this readability.")
 
+    recs = []
     if issues > 5:
         recs.append("Resolve linting warnings to improve consistency.")
     elif issues > 0:
@@ -77,168 +74,264 @@ def generate_l1_feedback(report: dict) -> dict:
     }
 
 
-# =========================================================
-# Shared Model Loader (GPU-Preferred Phi-3)
-# =========================================================
+# -----------------------
+# Shared model state (cached per-process)
+# -----------------------
+_phi_model = None
+_phi_tokenizer = None
+_phi_pipeline = None
+_model_id = "microsoft/Phi-3-mini-4k-instruct"
 
-_phi_model, _phi_tokenizer, _phi_pipeline = None, None, None
+# prompt / tokenization helpers
+_MAX_PROMPT_TOKENS = 3200  # conservative truncation for 4k models
+_MAX_NEW_TOKENS = 180      # reduced generation size for speed
+
+
+def _trim_prompt(prompt: str, max_chars: int = 24_000) -> str:
+    """
+    Trim prompt to a reasonable char length (not tokens) so we don't hit huge input costs.
+    For safety keep the trailing context (most relevant).
+    """
+    if len(prompt) <= max_chars:
+        return prompt
+    # keep last max_chars characters (likely contains summary/most-recent items)
+    return prompt[-max_chars:]
 
 
 def load_phi_model():
-    """Load Phi-3 Mini optimized for GPU; fallback to CPU if necessary."""
-    global _phi_model, _phi_tokenizer, _phi_pipeline
+    """
+    Safe loader for Phi-3 Mini (quantized if possible). Decides at runtime:
+    - If bitsandbytes is available and GPU present: try 4-bit quantization with CPU offload
+    - Else if GPU present: use float16 on GPU
+    - Else fallback to float32 on CPU
+    """
+    global _phi_model, _phi_tokenizer, _phi_pipeline, _model_id
 
-    if _phi_model is not None and _phi_pipeline is not None:
+    if _phi_pipeline is not None:
         return _phi_pipeline
 
-    print("[INFO] Loading Phi-3-Mini-4K-Instruct model...")
-    model_id = "microsoft/Phi-3-mini-4k-instruct"
-    _phi_tokenizer = AutoTokenizer.from_pretrained(model_id)
+    print("[INFO] Loading model:", _model_id)
+    _phi_tokenizer = AutoTokenizer.from_pretrained(_model_id, use_fast=True)
 
-    # Prefer GPU if available
+    # If GPU available try quantized path (bitsandbytes)
     if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        total_vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-        print(f"[INFO] GPU detected: {gpu_name} ({total_vram:.1f} GB VRAM)")
-
         try:
+            import bitsandbytes as bnb
+            from transformers import BitsAndBytesConfig
+
+            print("[INFO] bitsandbytes present: attempting 4-bit quantization with CPU offload.")
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+                llm_int8_enable_fp32_cpu_offload=True,  # allow offload of fp32 params to CPU
+            )
+
             _phi_model = AutoModelForCausalLM.from_pretrained(
-                model_id,
+                _model_id,
+                device_map="auto",
+                quantization_config=bnb_config,
+                low_cpu_mem_usage=True
+            )
+            print("[INFO] Loaded quantized model with bitsandbytes (device_map=auto).")
+
+        except Exception as exc:
+            # if quantization fails, fallback to float16 on GPU
+            print(f"[WARN] Quantized load failed ({exc}). Falling back to float16 on GPU.")
+            _phi_model = AutoModelForCausalLM.from_pretrained(
+                _model_id,
                 device_map="cuda",
                 torch_dtype=torch.float16,
                 low_cpu_mem_usage=True
             )
-            print("[INFO] Model successfully loaded on GPU ✅")
-        except Exception as e:
-            print(f"[WARN] GPU load failed ({e}); falling back to CPU.")
-            _phi_model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                torch_dtype=torch.float32
-            )
+            print("[INFO] Loaded model on GPU with float16.")
     else:
-        print("[INFO] No GPU available → Loading on CPU (float32).")
+        # No GPU: load on CPU (float32)
+        print("[INFO] No GPU available — loading model on CPU (float32).")
         _phi_model = AutoModelForCausalLM.from_pretrained(
-            model_id,
+            _model_id,
             torch_dtype=torch.float32
         )
 
+    # Create a pipeline around the loaded model for convenience
+    # Use explicit device: the model will already be placed by device_map/auto
     _phi_pipeline = pipeline("text-generation", model=_phi_model, tokenizer=_phi_tokenizer)
-    print(f"[INFO] Model device: {_phi_model.device}")
-    print("[INFO] Phi-3-Mini-4K-Instruct loaded and ready ✅")
+    print(f"[INFO] Model ready. Main device: {_phi_model.device}")
     return _phi_pipeline
 
 
-# =========================================================
-# L2 & L3 AI Feedback
-# =========================================================
-
-def generate_l2_feedback(report: dict) -> dict:
-    """Generate structured AI feedback."""
-    text_gen = load_phi_model()
-    summary = report.get("summary", {})
-    functions = report.get("details", {}).get("ast_analysis", [])
-    func_names = [f["name"] for f in functions]
-    code_summary = json.dumps(summary, indent=2)
-
-    prompt = f"""
-You are CodeSage, an expert AI code reviewer. Respond ONLY with valid JSON.
-
-Analyze this Python code report:
-{code_summary}
-
-Functions: {', '.join(func_names) if func_names else 'None'}
-
-Return JSON only:
-{{
-  "summary": "Brief overall evaluation.",
-  "function_feedback": ["Feedback for each function"],
-  "general_recommendations": ["2–3 concise suggestions"]
-}}
-"""
-
-    response = text_gen(prompt, max_new_tokens=400, temperature=0.4, top_p=0.9, do_sample=True)
-    text_output = response[0]["generated_text"].strip()
-
-    import re
-    matches = re.findall(r'\{(?:[^{}]|(?:\{[^{}]*\}))*\}', text_output, re.DOTALL)
-    for m in reversed(matches):
-        try:
-            return {**json.loads(m), "score": summary.get("overall_score", 0)}
-        except json.JSONDecodeError:
-            continue
-
-    return {"summary": text_output, "function_feedback": [], "general_recommendations": [], "score": 0}
+# -----------------------
+# JSON extraction helper
+# -----------------------
+_json_block_re = re.compile(r'\{(?:[^{}]|(?:\{[^{}]*\}))*\}', re.DOTALL)
 
 
-def generate_l3_feedback(report: dict) -> dict:
-    """Refine and polish L2 output."""
-    text_gen = load_phi_model()
-    l2_output = generate_l2_feedback(report)
-    l2_json = json.dumps(l2_output, indent=2)
-
-    prompt = f"""
-You are CodeSage's expert refinement AI.
-Analyze the input JSON, which includes function-level feedback and insights.
-
-Task:
-- Refine wording for clarity and professionalism.
-- Merge redundant points.
-- Ensure JSON validity and keep structure intact.
-
-Input JSON:
-{l2_json}
-
-Return only valid JSON.
-"""
-
-    response = text_gen(prompt, max_new_tokens=400, temperature=0.3, top_p=0.9)
-    text_output = response[0]["generated_text"].strip()
-
-    import re
-    matches = re.findall(r'\{(?:[^{}]|(?:\{[^{}]*\}))*\}', text_output, re.DOTALL)
+def _extract_json_from_text(text: str):
+    """
+    Find the last well-formed JSON object in 'text' and return its parsed value.
+    Return None if not found/parseable.
+    """
+    matches = _json_block_re.findall(text)
+    if not matches:
+        return None
+    # Try the last match first (most likely the model's final JSON block)
     for m in reversed(matches):
         try:
             return json.loads(m)
         except json.JSONDecodeError:
             continue
+    return None
+
+
+# -----------------------
+# L2: generate with local model
+# -----------------------
+def generate_l2_feedback(report: dict) -> dict:
+    """Generate structured AI feedback (JSON-enforced)."""
+    text_gen = load_phi_model()
+    summary = report.get("summary", {})
+    functions = report.get("details", {}).get("ast_analysis", [])
+    func_names = [f.get("name", "unknown") for f in functions]
+
+    code_summary = json.dumps(summary, indent=2)
+
+    prompt = f"""
+You are CodeSage, an expert AI code reviewer.
+
+Analyze the following Python code quality report and provide a constructive review.
+Be concise, professional, and insightful.
+
+Respond ONLY with a valid JSON object using these EXACT keys:
+  - summary: (1–2 lines describing overall code quality)
+  - function_feedback: (a list of 2–5 short comments, one per function)
+  - general_recommendations: (a list of 2–3 broader improvement suggestions)
+  - score: (overall numeric score out of 100)
+
+Example JSON:
+{{
+  "summary": "The code is clean and efficient, but could use better validation.",
+  "function_feedback": [
+    "Function 'foo' is well optimized.",
+    "Function 'bar' should include input validation."
+  ],
+  "general_recommendations": [
+    "Add type hints.",
+    "Use logging instead of print statements."
+  ],
+  "score": 89.5
+}}
+
+Code Report:
+{json.dumps(summary, indent=2)}
+
+Functions: {', '.join(func_names) if func_names else 'None'}
+"""
+
+    prompt = _trim_prompt(prompt)
+
+    with torch.inference_mode():
+        response = _phi_model.generate(
+            **_phi_tokenizer(prompt, return_tensors="pt").to(_phi_model.device),
+            max_new_tokens=280,
+            temperature=0.4,
+            top_p=0.9,
+            do_sample=True
+        )
+
+    text_output = _phi_tokenizer.decode(response[0], skip_special_tokens=True).strip()
+    parsed = _extract_json_from_text(text_output)
+
+    if parsed:
+        parsed.setdefault("summary", "No summary provided.")
+        parsed.setdefault("function_feedback", [])
+        parsed.setdefault("general_recommendations", [])
+        parsed.setdefault("score", summary.get("overall_score", 0))
+        return parsed
+
+    # Fallback JSON to prevent UI blanks
+    return {
+        "summary": "Could not extract structured feedback, but model response was:",
+        "function_feedback": [text_output],
+        "general_recommendations": [],
+        "score": summary.get("overall_score", 0)
+    }
+
+
+
+# -----------------------
+# L3: refinement (polish L2 output)
+# -----------------------
+def generate_l3_feedback(report: dict) -> dict:
+    """Refine and polish L2 feedback while enforcing proper JSON schema."""
+    text_gen = load_phi_model()
+    l2_output = generate_l2_feedback(report)
+    l2_json = json.dumps(l2_output, indent=2)
+
+    prompt = f"""
+You are CodeSage's refinement AI.
+You will rewrite the provided JSON feedback with improved clarity,
+but keep the same structure and keys.
+
+ALWAYS respond ONLY with valid JSON containing:
+  - summary
+  - function_feedback
+  - general_recommendations
+  - score
+
+Input JSON:
+{l2_json}
+"""
+    prompt = _trim_prompt(prompt)
+
+    with torch.inference_mode():
+        response = _phi_model.generate(
+            **_phi_tokenizer(prompt, return_tensors="pt").to(_phi_model.device),
+            max_new_tokens=220,
+            temperature=0.35,
+            top_p=0.9,
+            do_sample=True
+        )
+
+    text_output = _phi_tokenizer.decode(response[0], skip_special_tokens=True).strip()
+    parsed = _extract_json_from_text(text_output)
+
+    if parsed:
+        parsed.setdefault("summary", "No summary provided.")
+        parsed.setdefault("function_feedback", [])
+        parsed.setdefault("general_recommendations", [])
+        parsed.setdefault("score", l2_output.get("score", 0))
+        return parsed
+
+    # fallback if model failed to produce JSON
     return l2_output
 
 
-# =========================================================
-# AUTO SELECTION ENGINE
-# =========================================================
 
+# -----------------------
+# auto selection
+# -----------------------
 def auto_select_feedback_engine(report: dict) -> dict:
-    """Automatically pick L1/L2/L3 based on GPU VRAM."""
     try:
         if torch.cuda.is_available():
             vram = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-            gpu_name = torch.cuda.get_device_name(0)
-            print(f"[AUTO] GPU detected: {gpu_name} ({vram:.1f} GB VRAM)")
-
+            print(f"[AUTO] GPU detected: {torch.cuda.get_device_name(0)} ({vram:.1f} GB VRAM)")
             if vram >= 6:
-                print("[AUTO] Using L3 (Refined Feedback)")
                 return generate_l3_feedback(report)
             elif vram >= 3:
-                print("[AUTO] Using L2 (AI Analysis)")
                 return generate_l2_feedback(report)
             else:
-                print("[AUTO] Using L1 (Heuristic Feedback)")
                 return generate_l1_feedback(report)
         else:
-            print("[AUTO] No GPU detected → Using L1 (Heuristic)")
             return generate_l1_feedback(report)
     except Exception as e:
-        print(f"[AUTO] Error: {e} → Falling back to L1")
+        print("[AUTO] error:", e)
         return generate_l1_feedback(report)
 
 
-# =========================================================
-# MAIN INTERFACE
-# =========================================================
-
+# -----------------------
+# main entry
+# -----------------------
 def generate_feedback(report: dict, mode: str | None = None) -> dict:
-    """Select feedback engine manually or automatically."""
     mode = (mode or getattr(config, "FEEDBACK_MODE", "L1")).upper()
     if mode == "AUTO":
         return auto_select_feedback_engine(report)
@@ -250,10 +343,7 @@ def generate_feedback(report: dict, mode: str | None = None) -> dict:
         return generate_l1_feedback(report)
 
 
-# =========================================================
-# TEST ENTRY POINT
-# =========================================================
-
+# CLI
 if __name__ == "__main__":
     import sys
     from pathlib import Path
@@ -264,12 +354,6 @@ if __name__ == "__main__":
         sys.exit(1)
 
     target_path = Path(sys.argv[1])
-    print(f"[INFO] Generating static report for {target_path.name} ...")
     report = generate_code_report(target_path)
-
-    print("[INFO] Running auto-tier feedback selection...")
-    feedback = generate_feedback(report)
-
-    print("\n=== CODE REVIEW FEEDBACK ===\n")
+    feedback = generate_feedback(report, mode="L2")
     print(json.dumps(feedback, indent=2, ensure_ascii=False))
-    print("\n[INFO] Done ✅")
